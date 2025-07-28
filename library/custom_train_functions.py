@@ -1,8 +1,16 @@
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import torch
 import argparse
 import random
 import re
+from torch.types import Number
 from typing import List, Optional, Union
+from .utils import setup_logging
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def prepare_scheduler_for_custom_training(noise_scheduler, device):
@@ -19,20 +27,85 @@ def prepare_scheduler_for_custom_training(noise_scheduler, device):
     noise_scheduler.all_snr = all_snr.to(device)
 
 
-def apply_snr_weight(loss, timesteps, noise_scheduler, gamma):
+def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
+    # fix beta: zero terminal SNR
+    logger.info(f"fix noise scheduler betas: https://arxiv.org/abs/2305.08891")
+
+    def enforce_zero_terminal_snr(betas):
+        # Convert betas to alphas_bar_sqrt
+        alphas = 1 - betas
+        alphas_bar = alphas.cumprod(0)
+        alphas_bar_sqrt = alphas_bar.sqrt()
+
+        # Store old values.
+        alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
+        alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+        # Shift so last timestep is zero.
+        alphas_bar_sqrt -= alphas_bar_sqrt_T
+        # Scale so first timestep is back to old value.
+        alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+
+        # Convert alphas_bar_sqrt to betas
+        alphas_bar = alphas_bar_sqrt**2
+        alphas = alphas_bar[1:] / alphas_bar[:-1]
+        alphas = torch.cat([alphas_bar[0:1], alphas])
+        betas = 1 - alphas
+        return betas
+
+    betas = noise_scheduler.betas
+    betas = enforce_zero_terminal_snr(betas)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+    # logger.info(f"original: {noise_scheduler.betas}")
+    # logger.info(f"fixed: {betas}")
+
+    noise_scheduler.betas = betas
+    noise_scheduler.alphas = alphas
+    noise_scheduler.alphas_cumprod = alphas_cumprod
+
+
+def apply_snr_weight(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, gamma: Number, v_prediction=False):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    gamma_over_snr = torch.div(torch.ones_like(snr) * gamma, snr)
-    snr_weight = torch.minimum(gamma_over_snr, torch.ones_like(gamma_over_snr)).float().to(loss.device)  # from paper
+    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+    if v_prediction:
+        snr_weight = torch.div(min_snr_gamma, snr + 1).float().to(loss.device)
+    else:
+        snr_weight = torch.div(min_snr_gamma, snr).float().to(loss.device)
     loss = loss * snr_weight
     return loss
 
 
-def scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler):
+def scale_v_prediction_loss_like_noise_prediction(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler):
+    scale = get_snr_scale(timesteps, noise_scheduler)
+    loss = loss * scale
+    return loss
+
+
+def get_snr_scale(timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler):
     snr_t = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])  # batch_size
     snr_t = torch.minimum(snr_t, torch.ones_like(snr_t) * 1000)  # if timestep is 0, snr_t is inf, so limit it to 1000
     scale = snr_t / (snr_t + 1)
+    # # show debug info
+    # logger.info(f"timesteps: {timesteps}, snr_t: {snr_t}, scale: {scale}")
+    return scale
 
-    loss = loss * scale
+
+def add_v_prediction_like_loss(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, v_pred_like_loss: torch.Tensor):
+    scale = get_snr_scale(timesteps, noise_scheduler)
+    # logger.info(f"add v-prediction like loss: {v_pred_like_loss}, scale: {scale}, loss: {loss}, time: {timesteps}")
+    loss = loss + loss / scale * v_pred_like_loss
+    return loss
+
+
+def apply_debiased_estimation(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, v_prediction=False):
+    snr_t = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])  # batch_size
+    snr_t = torch.minimum(snr_t, torch.ones_like(snr_t) * 1000)  # if timestep is 0, snr_t is inf, so limit it to 1000
+    if v_prediction:
+        weight = 1 / (snr_t + 1)
+    else:
+        weight = 1 / torch.sqrt(snr_t)
+    loss = weight * loss
     return loss
 
 
@@ -50,6 +123,17 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "--scale_v_pred_loss_like_noise_pred",
         action="store_true",
         help="scale v-prediction loss like noise prediction loss / v-prediction lossをnoise prediction lossと同じようにスケーリングする",
+    )
+    parser.add_argument(
+        "--v_pred_like_loss",
+        type=float,
+        default=None,
+        help="add v-prediction like loss multiplied by this value / v-prediction lossをこの値をかけたものをlossに加算する",
+    )
+    parser.add_argument(
+        "--debiased_estimation_loss",
+        action="store_true",
+        help="debiased estimation loss / debiased estimation loss",
     )
     if support_weighted_captions:
         parser.add_argument(
@@ -197,7 +281,7 @@ def get_prompts_with_weights(tokenizer, prompt: List[str], max_length: int):
         tokens.append(text_token)
         weights.append(text_weight)
     if truncated:
-        print("Prompt was truncated. Try to shorten the prompt or increase max_embeddings_multiples")
+        logger.warning("Prompt was truncated. Try to shorten the prompt or increase max_embeddings_multiples")
     return tokens, weights
 
 
@@ -371,7 +455,7 @@ def get_weighted_text_embeddings(
 
 
 # https://wandb.ai/johnowhitaker/multires_noise/reports/Multi-Resolution-Noise-for-Diffusion-Model-Training--VmlldzozNjYyOTU2
-def pyramid_noise_like(noise, device, iterations=6, discount=0.4):
+def pyramid_noise_like(noise, device, iterations=6, discount=0.4) -> torch.FloatTensor:
     b, c, w, h = noise.shape  # EDIT: w and h get over-written, rename for a different variant!
     u = torch.nn.Upsample(size=(w, h), mode="bilinear").to(device)
     for i in range(iterations):
@@ -384,7 +468,7 @@ def pyramid_noise_like(noise, device, iterations=6, discount=0.4):
 
 
 # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-def apply_noise_offset(latents, noise, noise_offset, adaptive_noise_scale):
+def apply_noise_offset(latents, noise, noise_offset, adaptive_noise_scale) -> torch.FloatTensor:
     if noise_offset is None:
         return noise
     if adaptive_noise_scale is not None:
@@ -398,6 +482,25 @@ def apply_noise_offset(latents, noise, noise_offset, adaptive_noise_scale):
 
     noise = noise + noise_offset * torch.randn((latents.shape[0], latents.shape[1], 1, 1), device=latents.device)
     return noise
+
+
+def apply_masked_loss(loss, batch) -> torch.FloatTensor:
+    if "conditioning_images" in batch:
+        # conditioning image is -1 to 1. we need to convert it to 0 to 1
+        mask_image = batch["conditioning_images"].to(dtype=loss.dtype)[:, 0].unsqueeze(1)  # use R channel
+        mask_image = mask_image / 2 + 0.5
+        # print(f"conditioning_image: {mask_image.shape}")
+    elif "alpha_masks" in batch and batch["alpha_masks"] is not None:
+        # alpha mask is 0 to 1
+        mask_image = batch["alpha_masks"].to(dtype=loss.dtype).unsqueeze(1) # add channel dimension
+        # print(f"mask_image: {mask_image.shape}, {mask_image.mean()}")
+    else:
+        return loss
+
+    # resize to the same size as the loss
+    mask_image = torch.nn.functional.interpolate(mask_image, size=loss.shape[2:], mode="area")
+    loss = loss * mask_image
+    return loss
 
 
 """

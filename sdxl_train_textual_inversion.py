@@ -1,11 +1,15 @@
 import argparse
 import os
+from typing import Optional, Union
 
 import regex
-import torch
-import open_clip
-from library import sdxl_model_util, sdxl_train_util, train_util
 
+import torch
+from library.device_utils import init_ipex
+
+init_ipex()
+
+from library import sdxl_model_util, sdxl_train_util, strategy_sd, strategy_sdxl, train_util
 import train_textual_inversion
 
 
@@ -13,10 +17,15 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
     def __init__(self):
         super().__init__()
         self.vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
+        self.is_sdxl = True
 
-    def assert_extra_args(self, args, train_dataset_group):
-        super().assert_extra_args(args, train_dataset_group)
-        sdxl_train_util.verify_sdxl_training_args(args)
+    def assert_extra_args(self, args, train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset], val_dataset_group: Optional[train_util.DatasetGroup]):
+        super().assert_extra_args(args, train_dataset_group, val_dataset_group)
+        sdxl_train_util.verify_sdxl_training_args(args, supportTextEncoderCaching=False)
+
+        train_dataset_group.verify_bucket_reso_steps(32)
+        if val_dataset_group is not None:
+            val_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
         (
@@ -27,47 +36,28 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
             unet,
             logit_scale,
             ckpt_info,
-        ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V0_9, weight_dtype)
+        ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
 
         self.load_stable_diffusion_format = load_stable_diffusion_format
         self.logit_scale = logit_scale
         self.ckpt_info = ckpt_info
 
-        return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V0_9, [text_encoder1, text_encoder2], vae, unet
+        return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
 
-    def load_tokenizer(self, args):
-        tokenizer = sdxl_train_util.load_tokenizers(args)
-        return tokenizer
+    def get_tokenize_strategy(self, args):
+        return strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
 
-    def assert_token_string(self, token_string, tokenizers):
-        # tokenizer 1 is seems to be ok
+    def get_tokenizers(self, tokenize_strategy: strategy_sdxl.SdxlTokenizeStrategy):
+        return [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]
 
-        # count words for token string: regular expression from open_clip
-        pat = regex.compile(r"""'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+""", regex.IGNORECASE)
-        words = regex.findall(pat, token_string)
-        word_count = len(words)
-        assert word_count == 1, (
-            f"token string {token_string} contain {word_count} words, please don't use digits, punctuation, or special characters"
-            + f" / トークン文字列 {token_string} には{word_count}個の単語が含まれています。数字、句読点、特殊文字は使用しないでください"
+    def get_latents_caching_strategy(self, args):
+        latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
+            False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
         )
+        return latents_caching_strategy
 
-    def get_text_cond(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype):
-        input_ids1 = batch["input_ids"]
-        input_ids2 = batch["input_ids2"]
-        with torch.enable_grad():
-            input_ids1 = input_ids1.to(accelerator.device)
-            input_ids2 = input_ids2.to(accelerator.device)
-            encoder_hidden_states1, encoder_hidden_states2, pool2 = sdxl_train_util.get_hidden_states(
-                args,
-                input_ids1,
-                input_ids2,
-                tokenizers[0],
-                tokenizers[1],
-                text_encoders[0],
-                text_encoders[1],
-                None if not args.full_fp16 else weight_dtype,
-            )
-        return encoder_hidden_states1, encoder_hidden_states2, pool2
+    def get_text_encoding_strategy(self, args):
+        return strategy_sdxl.SdxlTextEncodingStrategy()
 
     def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype):
         noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
@@ -86,12 +76,14 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
         noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
         return noise_pred
 
-    def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet, prompt_replacement):
+    def sample_images(
+        self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoders, unet, prompt_replacement
+    ):
         sdxl_train_util.sample_images(
-            accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet, prompt_replacement
+            accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoders, unet, prompt_replacement
         )
 
-    def save_weights(self, file, updated_embs, save_dtype):
+    def save_weights(self, file, updated_embs, save_dtype, metadata):
         state_dict = {"clip_l": updated_embs[0], "clip_g": updated_embs[1]}
 
         if save_dtype is not None:
@@ -103,7 +95,7 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
 
-            save_file(state_dict, file)
+            save_file(state_dict, file, metadata)
         else:
             torch.save(state_dict, file)
 
@@ -115,8 +107,8 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
         else:
             data = torch.load(file, map_location="cpu")
 
-        emb_l = data.get("clib_l", None)  # ViT-L text encoder 1
-        emb_g = data.get("clib_g", None)  # BiG-G text encoder 2
+        emb_l = data.get("clip_l", None)  # ViT-L text encoder 1
+        emb_g = data.get("clip_g", None)  # BiG-G text encoder 2
 
         assert (
             emb_l is not None or emb_g is not None
@@ -127,8 +119,7 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_textual_inversion.setup_parser()
-    # don't add sdxl_train_util.add_sdxl_training_arguments(parser): because it only adds text encoder caching
-    # sdxl_train_util.add_sdxl_training_arguments(parser)
+    sdxl_train_util.add_sdxl_training_arguments(parser, support_text_encoder_caching=False)
     return parser
 
 
@@ -136,6 +127,7 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
+    train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
 
     trainer = SdxlTextualInversionTrainer()
